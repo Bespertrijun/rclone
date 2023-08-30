@@ -60,7 +60,7 @@ func init() {
 			Name:     "seid",
 			Help:     "SEID from cookie",
 			Required: true,
-		},, {
+		}, {
 			Name:     "timeout",
 			Help:     "Download more than how long to cancel the download task (base on your vfs read chunk size)",
 			Required: true,

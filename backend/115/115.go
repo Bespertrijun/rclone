@@ -151,16 +151,12 @@ func (nrc *NewReadCloser) Read(p []byte) (n int, err error) {
 			nrc.d.wg.Wait()
 			close(done)
 		}()
-		jump := true
-		for jump {
-			select {
-			case <-done:
-				jump = false
-				break
-			case <-time.After(time.Duration(nrc.d.timeout) * time.Second):
-				nrc.d.cancle()
-				return 0, nrc.d.ctx.Err()
-			}
+		select {
+		case <-done:
+			break
+		case <-time.After(time.Duration(nrc.d.timeout) * time.Second):
+			nrc.d.cancle()
+			return 0, nrc.d.ctx.Err()
 		}
 		var listreader []io.Reader
 		for i := 0; i < 2; i++ {

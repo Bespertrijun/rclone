@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"net/url"
 	"path"
@@ -29,6 +28,7 @@ import (
 	"github.com/rclone/rclone/lib/encoder"
 	"github.com/rclone/rclone/lib/pacer"
 	"github.com/rclone/rclone/lib/rest"
+	"github.com/shirou/gopsutil/mem"
 )
 
 const (
@@ -41,6 +41,52 @@ const (
 	maxSleep        = 2 * time.Second
 	decayConstant   = 2
 )
+
+var bufpool = sync.Pool{
+	New: func() interface{} {
+		return bytes.NewReader(nil)
+	},
+}
+
+var nrcpool = sync.Pool{
+	New: func() interface{} {
+		d := NewDownloader()
+		nrc := &NewReadCloser{
+			r: nil,
+			d: d}
+		return nrc
+	},
+}
+
+// GetBuffer 返回池中一个 Buffer
+func GetBuffer() *bytes.Reader {
+	return bufpool.Get().(*bytes.Reader)
+}
+
+// PutBuffer 将 Buffer 重新放入池中
+func PutBuffer(buf *bytes.Reader) {
+	buf.Reset(nil)
+	bufpool.Put(buf)
+}
+
+func (nrc *NewReadCloser) Reset() {
+	close(nrc.d.errCh)
+	errCh := make(chan error, 2)
+	nrc.d.errCh = errCh
+	nrc.d.once = true
+	nrc.d.close = make(chan bool)
+	nrc.d.m.Delete(1)
+	nrc.d.m.Delete(2)
+}
+
+func GetNrc() *NewReadCloser {
+	return nrcpool.Get().(*NewReadCloser)
+}
+
+func PutNrc(nrc *NewReadCloser) {
+	nrc.Reset()
+	nrcpool.Put(nrc)
+}
 
 // Register with Fs
 func init() {
@@ -120,23 +166,21 @@ type Object struct {
 }
 
 type Downloader struct {
-	ctx     context.Context
-	cancle  context.CancelFunc
 	timeout int64
-	m       sync.Map
+	m       *sync.Map
 	client  *http.Client
 	errCh   chan error
-	wg      sync.WaitGroup
+	wg      chan bool
 	once    bool
+	close   chan bool
 }
 
 func NewDownloader() *Downloader {
-	var wg sync.WaitGroup
 	var m sync.Map
-	ctx, cancle := context.WithCancel(context.Background())
 	client := &http.Client{}
 	errCh := make(chan error, 2)
-	return &Downloader{ctx, cancle, 0, m, client, errCh, wg, true}
+	close := make(chan bool)
+	return &Downloader{0, &m, client, errCh, nil, true, close}
 }
 
 type NewReadCloser struct {
@@ -147,16 +191,21 @@ type NewReadCloser struct {
 func (nrc *NewReadCloser) Read(p []byte) (n int, err error) {
 	if nrc.d.once {
 		done := make(chan struct{})
+		timeout := make(chan bool)
 		go func() {
-			nrc.d.wg.Wait()
-			close(done)
+			select {
+			case <-nrc.d.wg:
+				close(done)
+			case <-timeout:
+				return
+			}
 		}()
 		select {
 		case <-done:
 			break
 		case <-time.After(time.Duration(nrc.d.timeout) * time.Second):
-			nrc.d.cancle()
-			return 0, nrc.d.ctx.Err()
+			close(timeout)
+			return 0, fmt.Errorf("Download timeout")
 		}
 		var listreader []io.Reader
 		for i := 0; i < 2; i++ {
@@ -171,8 +220,7 @@ func (nrc *NewReadCloser) Read(p []byte) (n int, err error) {
 	}
 	select {
 	case err = <-nrc.d.errCh:
-		fmt.Println("errch get err")
-		return 0, err
+		return 0, fmt.Errorf("errch get err: ", err)
 	default:
 		n, err = nrc.r.Read(p)
 		if err != io.EOF {
@@ -185,13 +233,17 @@ func (nrc *NewReadCloser) Read(p []byte) (n int, err error) {
 
 func (nrc *NewReadCloser) Close() error {
 	for i := 0; i < 2; i++ {
-		if _, ok := nrc.d.m.Load(i); ok {
-			nrc.d.m.Store(i, nil)
+		if v, ok := nrc.d.m.Load(i); ok {
+			if buf, ok := v.(bytes.Reader); ok {
+				PutBuffer(&buf)
+			}
 		}
 	}
+	close(nrc.d.close)
 	if nrc.r != nil {
 		nrc.r = nil
 	}
+	PutNrc(nrc)
 	return nil
 }
 
@@ -237,7 +289,8 @@ func NewFs(ctx context.Context, name string, root string, m configmap.Mapper) (f
 		}
 		return fmt.Errorf("HTTP error %v (%v) returned body: %q", resp.StatusCode, resp.Status, body)
 	})
-	f.pacer.SetMaxConnections(2)
+	f.pacer.SetMaxConnections(4)
+	f.urlpacer.SetMaxConnections(5)
 	f.srv.SetRoot("https://webapi.115.com")
 	f.srv.SetHeader("User-Agent", userAgent)
 	f.srv.SetCookie(&http.Cookie{
@@ -1100,40 +1153,49 @@ func (o *Object) Hash(ctx context.Context, t hash.Type) (string, error) {
 	return o.sha1sum, nil
 }
 
-func bufRead(ctx context.Context, rs io.ReadCloser, i int, d *Downloader) {
-	defer d.wg.Done()
+func bufRead(rs io.ReadCloser, i int, d *Downloader, wg *sync.WaitGroup) {
+	defer wg.Done()
 	var body []byte
 	var err error
-	once := make(chan bool)
-	go func() {
-		once <- true
-	}()
 	done := make(chan bool)
-	for {
+	closed := false
+	go func() {
 		select {
-		case <-ctx.Done():
+		case <-d.close:
 			rs.Close()
+			closed = true
 			return
-		case <-once:
-			go func() {
-				defer rs.Close()
-				body, err = ioutil.ReadAll(rs)
-				done <- true
-				if err == nil {
-					d.m.Store(i, bytes.NewBuffer(body))
-					return
-				} else {
-					d.errCh <- err
-					return
-				}
-			}()
 		case <-done:
 			return
 		}
+	}()
+	go func() {
+		defer rs.Close()
+		defer func() {
+			close(done)
+		}()
+		body, err = io.ReadAll(rs)
+		if err == nil && !closed {
+			buf := GetBuffer()
+			buf.Reset(body)
+			d.m.Store(i, buf)
+			return
+		} else {
+			if closed {
+				return
+			} else {
+				d.errCh <- err
+				return
+			}
+		}
+	}()
+	select {
+	case <-done:
+		return
 	}
 }
 
-func (o *Object) download(url string, d *Downloader, i int, ran string) {
+func (o *Object) download(url string, d *Downloader, i int, ran string, wg *sync.WaitGroup) {
 	ck := fmt.Sprintf("UID=%s;SEID=%s;CID=%s;", o.fs.opt.UID, o.fs.opt.SEID, o.fs.opt.CID)
 
 	req, err := http.NewRequest("GET", url, nil)
@@ -1157,7 +1219,27 @@ func (o *Object) download(url string, d *Downloader, i int, ran string) {
 		resp, err = d.client.Do(req)
 		fs.Logf(o.fs, "repeatrequest:", resp.StatusCode, "Header:", req.Header)
 	}
-	go bufRead(d.ctx, resp.Body, i, d)
+	go bufRead(resp.Body, i, d, wg)
+	return
+}
+
+func (o *Object) open(ctx context.Context, targetURL string, options []fs.OpenOption) (in io.ReadCloser, err error) {
+	opts := rest.Opts{
+		Method:  http.MethodGet,
+		RootURL: targetURL,
+		Options: options,
+	}
+
+	var resp *http.Response
+	err = o.fs.pacer.Call(func() (bool, error) {
+		resp, err = o.fs.srv.Call(ctx, &opts)
+		return shouldRetry(ctx, resp, err)
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return resp.Body, err
 }
 
 // Open opens the file for read.  Call Close() on the returned io.ReadCloser
@@ -1168,6 +1250,18 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 		fs.Logf(o.fs, "url err: ", err)
 		return nil, err
 	}
+	memory, err := mem.VirtualMemory()
+	if err != nil {
+		fs.Logf(o.fs, "无法获取内存使用信息: ", err)
+		return nil, err
+	}
+	usedMemoryPercentage := memory.UsedPercent
+	if usedMemoryPercentage > 80.0 {
+		fs.Logf(o.fs, "内存占用大于80%，%v 进入单线程模式", o.remote)
+		in, err = o.open(ctx, targetURL, options)
+		return in, err
+	}
+
 	fs.FixRangeOption(options, o.size)
 	var ranges []string
 	for _, option := range options {
@@ -1191,17 +1285,31 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 			}
 		}
 	}
-	d := NewDownloader()
-	d.timeout = o.fs.opt.Timeout
+	nrc := GetNrc()
+	nrc.d.timeout = o.fs.opt.Timeout
+	nrc.d.wg = make(chan bool)
+	closed := false
+	go func() {
+		select {
+		case <-nrc.d.close:
+			closed = true
+		}
+	}()
 	fs.Logf(o.fs, "range:", ranges)
+	var wg sync.WaitGroup
 	for i, v := range ranges {
-		d.wg.Add(1)
-		go o.download(targetURL, d, i, v)
+		wg.Add(1)
+		go o.download(targetURL, nrc.d, i, v, &wg)
 	}
-	in = &NewReadCloser{
-		r: nil,
-		d: d}
-	return in, nil
+	go func() {
+		wg.Wait()
+		if !closed {
+			close(nrc.d.wg)
+		}
+		return
+	}()
+	err = nil
+	return nrc, err
 }
 
 // Remove this object

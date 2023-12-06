@@ -1205,6 +1205,12 @@ func bufRead(rs io.ReadCloser, i int, d *Downloader, wg *sync.WaitGroup) {
 	}
 }
 
+type errResponse struct {
+	Status     int64  `json:"status"`
+	Message    string `json:"message"`
+	Request_id string `json:"request_id"`
+}
+
 func (o *Object) download(url string, d *Downloader, i int, ran string, wg *sync.WaitGroup) {
 	ck := fmt.Sprintf("UID=%s;SEID=%s;CID=%s;", o.fs.opt.UID, o.fs.opt.SEID, o.fs.opt.CID)
 	req, err := http.NewRequest("GET", url, nil)
@@ -1226,6 +1232,18 @@ func (o *Object) download(url string, d *Downloader, i int, ran string, wg *sync
 		time.Sleep(1 * time.Second)
 		r, _ := io.ReadAll(resp.Body)
 		fs.Logf(o.fs, o.name, "Range: ", ran, "Status Code: ", resp.StatusCode, "Error: ", string(r))
+		response := errResponse{}
+		err = json.Unmarshal(r, &response)
+		if err != nil {
+			wg.Done()
+			d.errCh <- err
+			return
+		}
+		if response.Message[0:7] != "115 pmt" {
+			wg.Done()
+			d.errCh <- fmt.Errorf(o.name, "get expect error: ", response.Message)
+			return
+		}
 		resp.Body.Close()
 		resp, err = d.client.Do(req)
 	}

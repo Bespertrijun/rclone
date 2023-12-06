@@ -274,7 +274,7 @@ func NewFs(ctx context.Context, name string, root string, m configmap.Mapper) (f
 		root:     root,
 		opt:      *opt,
 		ci:       ci,
-		srv:      rest.NewClient(&http.Client{}),
+		srv:      rest.NewClient(&http.Client{Timeout: 1 * time.Minute}),
 		pacer:    fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
 		urlpacer: fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
 		cache:    cache.New(time.Minute, time.Minute*2),
@@ -1170,22 +1170,32 @@ func bufRead(rs io.ReadCloser, i int, d *Downloader, wg *sync.WaitGroup) {
 		}
 	}()
 	go func() {
-		defer rs.Close()
 		defer func() {
 			close(done)
 		}()
-		body, err = io.ReadAll(rs)
-		if err == nil && !closed {
-			buf := GetBuffer()
-			buf.Reset(body)
-			d.m.Store(i, buf)
+		read_done := make(chan bool)
+		go func() {
+			body, err = io.ReadAll(rs)
+			rs.Close()
+			close(read_done)
+		}()
+		select {
+		case <-time.After(300 * time.Second):
+			d.errCh <- fmt.Errorf("io.Readall timeout")
 			return
-		} else {
-			if closed {
+		case <-read_done:
+			if err == nil && !closed {
+				buf := GetBuffer()
+				buf.Reset(body)
+				d.m.Store(i, buf)
 				return
 			} else {
-				d.errCh <- err
-				return
+				if closed {
+					return
+				} else {
+					d.errCh <- err
+					return
+				}
 			}
 		}
 	}()
@@ -1197,7 +1207,6 @@ func bufRead(rs io.ReadCloser, i int, d *Downloader, wg *sync.WaitGroup) {
 
 func (o *Object) download(url string, d *Downloader, i int, ran string, wg *sync.WaitGroup) {
 	ck := fmt.Sprintf("UID=%s;SEID=%s;CID=%s;", o.fs.opt.UID, o.fs.opt.SEID, o.fs.opt.CID)
-
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		fs.Logf(o.fs, "Error creating request:", err)
@@ -1215,9 +1224,10 @@ func (o *Object) download(url string, d *Downloader, i int, ran string, wg *sync
 	}
 	for resp.StatusCode != 206 {
 		time.Sleep(1 * time.Second)
+		r, _ := io.ReadAll(resp.Body)
+		fs.Logf(o.fs, o.name, "Range: ", ran, "Status Code: ", resp.StatusCode, "Error: ", string(r))
 		resp.Body.Close()
 		resp, err = d.client.Do(req)
-		fs.Logf(o.fs, "repeatrequest:", resp.StatusCode, "Header:", req.Header)
 	}
 	go bufRead(resp.Body, i, d, wg)
 	return

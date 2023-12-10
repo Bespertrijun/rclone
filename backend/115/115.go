@@ -168,7 +168,6 @@ type Object struct {
 type Downloader struct {
 	timeout int64
 	m       *sync.Map
-	client  *http.Client
 	errCh   chan error
 	wg      chan bool
 	once    bool
@@ -177,10 +176,9 @@ type Downloader struct {
 
 func NewDownloader() *Downloader {
 	var m sync.Map
-	client := &http.Client{}
 	errCh := make(chan error, 2)
 	close := make(chan bool)
-	return &Downloader{0, &m, client, errCh, nil, true, close}
+	return &Downloader{0, &m, errCh, nil, true, close}
 }
 
 type NewReadCloser struct {
@@ -191,32 +189,28 @@ type NewReadCloser struct {
 func (nrc *NewReadCloser) Read(p []byte) (n int, err error) {
 	if nrc.d.once {
 		done := make(chan struct{})
-		timeout := make(chan bool)
 		go func() {
 			select {
 			case <-nrc.d.wg:
 				close(done)
-			case <-timeout:
-				return
 			}
 		}()
 		select {
 		case <-done:
-			break
-		case <-time.After(time.Duration(nrc.d.timeout) * time.Second):
-			close(timeout)
-			return 0, fmt.Errorf("Download timeout")
-		}
-		var listreader []io.Reader
-		for i := 0; i < 2; i++ {
-			if v, ok := nrc.d.m.Load(i); ok {
-				if reader, ok := v.(io.Reader); ok {
-					listreader = append(listreader, reader)
+			var listreader []io.Reader
+			for i := 0; i < 2; i++ {
+				if v, ok := nrc.d.m.Load(i); ok {
+					if reader, ok := v.(io.Reader); ok {
+						listreader = append(listreader, reader)
+					}
 				}
+				nrc.r = io.MultiReader(listreader...)
+				nrc.d.once = false
 			}
+			//case <-time.After(time.Duration(nrc.d.timeout) * time.Second):
+			//close(timeout)
+			//return 0, fmt.Errorf("Download timeout")
 		}
-		nrc.r = io.MultiReader(listreader...)
-		nrc.d.once = false
 	}
 	select {
 	case err = <-nrc.d.errCh:
@@ -251,6 +245,10 @@ func (nrc *NewReadCloser) Close() error {
 // deserve to be retried.  It returns the err as a convenience
 func shouldRetry(ctx context.Context, resp *http.Response, err error) (bool, error) {
 	// TODO: impl
+	if resp == nil {
+		fs.Errorf("Http request failed: ", fmt.Sprintf("%v, Ready to retry", err))
+		return true, nil
+	}
 	return false, err
 }
 
@@ -1214,6 +1212,7 @@ type errResponse struct {
 func (o *Object) download(url string, d *Downloader, i int, ran string, wg *sync.WaitGroup) {
 	ck := fmt.Sprintf("UID=%s;SEID=%s;CID=%s;", o.fs.opt.UID, o.fs.opt.SEID, o.fs.opt.CID)
 	req, err := http.NewRequest("GET", url, nil)
+	client := &http.Client{}
 	if err != nil {
 		fs.Logf(o.fs, "Error creating request:", err)
 		return
@@ -1223,7 +1222,7 @@ func (o *Object) download(url string, d *Downloader, i int, ran string, wg *sync
 	req.Header.Set("Range", fmt.Sprintf("%s=%s", "bytes", ran))
 	//var request http.Request
 	//ctx := context.WithValue(d.ctx, request, req)
-	resp, err := d.client.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		fs.Logf(o.fs, "Error sending request:", err)
 		return
@@ -1245,7 +1244,7 @@ func (o *Object) download(url string, d *Downloader, i int, ran string, wg *sync
 			return
 		}
 		resp.Body.Close()
-		resp, err = d.client.Do(req)
+		resp, err = client.Do(req)
 	}
 	go bufRead(resp.Body, i, d, wg)
 	return
@@ -1275,12 +1274,12 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 	fs.Logf(o.fs, "open %v, options: %v", o.remote, options)
 	targetURL, err := o.fs.getURL(ctx, o.remote, o.pickCode)
 	if err != nil {
-		fs.Logf(o.fs, "url err: ", err)
+		fs.Errorf(o.fs, "url err: ", err)
 		return nil, err
 	}
 	memory, err := mem.VirtualMemory()
 	if err != nil {
-		fs.Logf(o.fs, "无法获取内存使用信息: ", err)
+		fs.Errorf(o.fs, "无法获取内存使用信息: ", err)
 		return nil, err
 	}
 	usedMemoryPercentage := memory.UsedPercent

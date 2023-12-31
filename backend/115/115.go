@@ -1214,6 +1214,7 @@ func (o *Object) download(url string, d *Downloader, i int, ran string, wg *sync
 	req, err := http.NewRequest("GET", url, nil)
 	client := &http.Client{}
 	if err != nil {
+		d.errCh <- fmt.Errorf(o.name, "get expect error: ", err)
 		fs.Logf(o.fs, "Error creating request:", err)
 		return
 	}
@@ -1224,6 +1225,7 @@ func (o *Object) download(url string, d *Downloader, i int, ran string, wg *sync
 	//ctx := context.WithValue(d.ctx, request, req)
 	resp, err := client.Do(req)
 	if err != nil {
+		d.errCh <- fmt.Errorf(o.name, "get expect error: ", err)
 		fs.Logf(o.fs, "Error sending request:", err)
 		return
 	}
@@ -1245,6 +1247,11 @@ func (o *Object) download(url string, d *Downloader, i int, ran string, wg *sync
 		}
 		resp.Body.Close()
 		resp, err = client.Do(req)
+		if err != nil {
+			d.errCh <- fmt.Errorf(o.name, "get expect error: ", err)
+			fs.Logf(o.fs, "Error sending request:", err)
+			return
+		}
 	}
 	go bufRead(resp.Body, i, d, wg)
 	return

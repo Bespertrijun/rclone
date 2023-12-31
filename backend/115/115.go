@@ -1215,6 +1215,7 @@ func (o *Object) download(url string, d *Downloader, i int, ran string, wg *sync
 	client := &http.Client{}
 	if err != nil {
 		d.errCh <- fmt.Errorf(o.name, "get expect error: ", err)
+		wg.Done()
 		fs.Logf(o.fs, "Error creating request:", err)
 		return
 	}
@@ -1226,6 +1227,7 @@ func (o *Object) download(url string, d *Downloader, i int, ran string, wg *sync
 	resp, err := client.Do(req)
 	if err != nil {
 		d.errCh <- fmt.Errorf(o.name, "get expect error: ", err)
+		wg.Done()
 		fs.Logf(o.fs, "Error sending request:", err)
 		return
 	}
@@ -1236,19 +1238,20 @@ func (o *Object) download(url string, d *Downloader, i int, ran string, wg *sync
 		response := errResponse{}
 		err = json.Unmarshal(r, &response)
 		if err != nil {
-			wg.Done()
 			d.errCh <- err
+			wg.Done()
 			return
 		}
 		if response.Message[0:7] != "115 pmt" {
-			wg.Done()
 			d.errCh <- fmt.Errorf(o.name, "get expect error: ", response.Message)
+			wg.Done()
 			return
 		}
 		resp.Body.Close()
 		resp, err = client.Do(req)
 		if err != nil {
 			d.errCh <- fmt.Errorf(o.name, "get expect error: ", err)
+			wg.Done()
 			fs.Logf(o.fs, "Error sending request:", err)
 			return
 		}

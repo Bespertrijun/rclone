@@ -23,9 +23,11 @@ func mockNewFs(t *testing.T) func(ctx context.Context, path string) (fs.Fs, erro
 		called++
 		switch path {
 		case "mock:/":
-			return mockfs.NewFs(ctx, "mock", "/"), nil
+			return mockfs.NewFs(ctx, "mock", "/", nil)
 		case "mock:/file.txt", "mock:file.txt":
-			return mockfs.NewFs(ctx, "mock", "/"), fs.ErrorIsFile
+			fMock, err := mockfs.NewFs(ctx, "mock", "/", nil)
+			require.NoError(t, err)
+			return fMock, fs.ErrorIsFile
 		case "mock:/error":
 			return nil, errSentinel
 		}
@@ -114,10 +116,40 @@ func TestGetError(t *testing.T) {
 	assert.Equal(t, 0, Entries())
 }
 
+func TestPutErr(t *testing.T) {
+	create := mockNewFs(t)
+
+	f, err := mockfs.NewFs(context.Background(), "mock", "", nil)
+	require.NoError(t, err)
+
+	assert.Equal(t, 0, Entries())
+
+	PutErr("mock:file.txt", f, fs.ErrorIsFile)
+
+	assert.Equal(t, 1, Entries())
+
+	fNew, err := GetFn(context.Background(), "mock:file.txt", create)
+	require.Equal(t, fs.ErrorIsFile, err)
+	require.Equal(t, f, fNew)
+
+	assert.Equal(t, 1, Entries())
+
+	// Check canonicalisation
+
+	PutErr("mock:/file.txt", f, fs.ErrorIsFile)
+
+	fNew, err = GetFn(context.Background(), "mock:/file.txt", create)
+	require.Equal(t, fs.ErrorIsFile, err)
+	require.Equal(t, f, fNew)
+
+	assert.Equal(t, 1, Entries())
+}
+
 func TestPut(t *testing.T) {
 	create := mockNewFs(t)
 
-	f := mockfs.NewFs(context.Background(), "mock", "/alien")
+	f, err := mockfs.NewFs(context.Background(), "mock", "/alien", nil)
+	require.NoError(t, err)
 
 	assert.Equal(t, 0, Entries())
 
@@ -140,14 +172,14 @@ func TestPut(t *testing.T) {
 	require.Equal(t, f, fNew)
 
 	assert.Equal(t, 1, Entries())
-
 }
 
 func TestPin(t *testing.T) {
 	create := mockNewFs(t)
 
 	// Test pinning and unpinning nonexistent
-	f := mockfs.NewFs(context.Background(), "mock", "/alien")
+	f, err := mockfs.NewFs(context.Background(), "mock", "/alien", nil)
+	require.NoError(t, err)
 	Pin(f)
 	Unpin(f)
 

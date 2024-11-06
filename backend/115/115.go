@@ -29,6 +29,7 @@ import (
 	"github.com/rclone/rclone/lib/pacer"
 	"github.com/rclone/rclone/lib/rest"
 	"github.com/shirou/gopsutil/mem"
+	"golang.org/x/time/rate"
 )
 
 const (
@@ -186,6 +187,23 @@ type NewReadCloser struct {
 	d *Downloader
 }
 
+// 限流器
+type RateLimitedTransport struct {
+	Transport http.RoundTripper
+	limiter   *rate.Limiter
+}
+
+// 限流拦截器
+func (rlt *RateLimitedTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if rlt.limiter != nil {
+		err := rlt.limiter.Wait(req.Context())
+		if err != nil && err != context.Canceled {
+			return nil, err
+		}
+	}
+	return rlt.Transport.RoundTrip(req)
+}
+
 func (nrc *NewReadCloser) Read(p []byte) (n int, err error) {
 	if nrc.d.once {
 		done := make(chan struct{})
@@ -247,6 +265,7 @@ func shouldRetry(ctx context.Context, resp *http.Response, err error) (bool, err
 	// TODO: impl
 	if resp == nil {
 		fs.Errorf("Http request failed: ", fmt.Sprintf("%v, Ready to retry", err))
+		time.Sleep(1 * time.Second)
 		return true, nil
 	}
 	return false, err
@@ -267,12 +286,23 @@ func NewFs(ctx context.Context, name string, root string, m configmap.Mapper) (f
 		root = "/"
 	}
 	ci := fs.GetConfig(ctx)
+	var limiter *rate.Limiter
+	if ci.TPSLimit > 0 {
+		tpsBurst := ci.TPSLimitBurst
+		if tpsBurst < 1 {
+			tpsBurst = 1
+		}
+		limiter = rate.NewLimiter(rate.Limit(ci.TPSLimit), tpsBurst)
+	} else {
+		limiter = nil
+	}
+
 	f := &Fs{
 		name:     name,
 		root:     root,
 		opt:      *opt,
 		ci:       ci,
-		srv:      rest.NewClient(&http.Client{Timeout: 1 * time.Minute}),
+		srv:      rest.NewClient(&http.Client{Timeout: 1 * time.Minute, Transport: &RateLimitedTransport{Transport: http.DefaultTransport, limiter: limiter}}),
 		pacer:    fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
 		urlpacer: fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
 		cache:    cache.New(time.Minute, time.Minute*2),
@@ -1110,6 +1140,120 @@ func (f *Fs) flushDir(dir string) {
 	f.cache.Delete(cacheKey)
 }
 
+// ChangeNotify calls the passed function with a path that has had changes.
+// If the implementation uses polling, it should adhere to the given interval.
+//
+// Automatically restarts itself in case of unexpected behavior of the remote.
+//
+// Close the returned channel to stop being notified.
+func (f *Fs) ChangeNotify(ctx context.Context, notifyFunc func(string, fs.EntryType), pollIntervalChan <-chan time.Duration) {
+	go func() {
+		var ticker *time.Ticker
+		var tickerC <-chan time.Time
+		for {
+			select {
+			case pollInterval, ok := <-pollIntervalChan:
+				if !ok {
+					if ticker != nil {
+						ticker.Stop()
+					}
+					return
+				}
+				if ticker != nil {
+					ticker.Stop()
+					ticker, tickerC = nil, nil
+				}
+				if pollInterval != 0 {
+					ticker = time.NewTicker(pollInterval)
+					tickerC = ticker.C
+				}
+			case <-tickerC:
+				err := f.changeNotifyRunner(ctx, notifyFunc)
+				if err != nil {
+					fs.Infof(f, "Change notify listener failure: %s", err)
+				}
+			}
+		}
+	}()
+}
+
+func (f *Fs) changeNotifyRunner(ctx context.Context, notifyFunc func(string, fs.EntryType)) (err error) {
+	// for {
+	// 	//var changeList *drive.ChangeList
+
+	// 	err = f.pacer.Call(func() (bool, error) {
+	// 		//http requests for change
+	// 		return f.shouldRetry(ctx, err)
+	// 	})
+	// 	if err != nil {
+	// 		return
+	// 	}
+
+	// 	//entry init
+	// 	type entryType struct {
+	// 		path      string
+	// 		entryType fs.EntryType
+	// 	}
+	// 	//the item to change for vfs
+	// 	var pathsToClear []entryType
+	/*
+			for _, change := range changeList.Changes {
+				// find the previous path
+				if path, ok := f.dirCache.GetInv(change.FileId); ok {
+					if change.File != nil && change.File.MimeType != driveFolderType {
+						pathsToClear = append(pathsToClear, entryType{path: path, entryType: fs.EntryObject})
+					} else {
+						pathsToClear = append(pathsToClear, entryType{path: path, entryType: fs.EntryDirectory})
+					}
+				}
+
+				// find the new path
+				if change.File != nil {
+					change.File.Name = f.opt.Enc.ToStandardName(change.File.Name)
+					changeType := fs.EntryDirectory
+					if change.File.MimeType != driveFolderType {
+						changeType = fs.EntryObject
+					}
+
+					// translate the parent dir of this object
+					if len(change.File.Parents) > 0 {
+						for _, parent := range change.File.Parents {
+							if parentPath, ok := f.dirCache.GetInv(parent); ok {
+								// and append the drive file name to compute the full file name
+								newPath := path.Join(parentPath, change.File.Name)
+								// this will now clear the actual file too
+								pathsToClear = append(pathsToClear, entryType{path: newPath, entryType: changeType})
+							}
+						}
+					} else { // a true root object that is changed
+						pathsToClear = append(pathsToClear, entryType{path: change.File.Name, entryType: changeType})
+					}
+				}
+			}
+
+			visitedPaths := make(map[string]struct{})
+			for _, entry := range pathsToClear {
+				if _, ok := visitedPaths[entry.path]; ok {
+					continue
+				}
+				visitedPaths[entry.path] = struct{}{}
+				notifyFunc(entry.path, entry.entryType)
+			}
+
+			switch {
+			case changeList.NewStartPageToken != "":
+				return changeList.NewStartPageToken, nil
+			case changeList.NextPageToken != "":
+				pageToken = changeList.NextPageToken
+			default:
+				return
+			}
+		}
+	*/
+	// }
+	return nil
+}
+
 // ------------------------------------------------------------
 
 // Fs returns read only access to the Fs that this object is part of
@@ -1503,4 +1647,5 @@ var (
 	_ fs.ObjectInfo = (*Object)(nil)
 	_ fs.IDer       = (*Object)(nil)
 	// _ fs.MimeTyper = (*Object)(nil)
+	// _ fs.ChangeNotifier = (*Fs)(nil)
 )

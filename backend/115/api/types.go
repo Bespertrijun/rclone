@@ -194,3 +194,77 @@ func (r *MkdirResponse) GetErrno() int64 {
 
 	return 0
 }
+
+type Life struct {
+	State   bool         `json:"state"`
+	Code    int32        `json:"code"`
+	Message string       `json:"message"`
+	Data    LifeListData `json:"data"`
+}
+
+type LifeListData struct {
+	Count     int32    `json:"count"`
+	List      LifeList `json:"list"`
+	Last_data string   `json:"last_data"`
+}
+
+type LifeList struct {
+	Total         int32    `json:"total"`
+	Update_time   int64    `json:"update_time"`
+	Source        string   `json:"source"`
+	Date          YMDTime  `json:"date"`
+	Behavior_type string   `json:"behavior_type"`
+	Items         LifeItem `json:"items"`
+	Tab_title     string   `json:"tab_title"`
+	Relation_id   string   `json:"relation_id"`
+}
+
+type LifeItem struct {
+	Id json.Number `json:"id"`
+	//1:移动，上传，接受文件 2：增删文件 3：未知 4：登录安全
+	Type          int32       `json:"type"`
+	User_id       int32       `json:"user_id"`
+	File_id       json.Number `json:"file_id"`
+	Parent_id     json.Number `json:"parent_id"`
+	File_name     string      `json:"file_name"`
+	File_category string      `json:"file_category"`
+	File_type     int32       `json:"file_type"`
+	File_size     json.Number `json:"file_size"`
+	Sha1          string      `json:"sha1"`
+	Pick_code     string      `json:"pick_code"`
+	Is_private    int32       `json:"is_private"`
+	Update_time   int64       `json:"update_time"`
+	Create_time   int64       `json:"create_time"`
+	source        string      `json:"source"`
+	Isv           int32       `json:"isv"`
+	Is_mark       int32       `json:"is_mark"`
+	//Fl       int32       `json:"fl"`
+	Parent_name string `json:"parent_name"`
+	Ico         string `json:"ico"`
+	D_img       string `json:"d_img"`
+	Play_long   int32  `json:"play_long"`
+	Vdi         int32  `json:"vdi"`
+}
+
+type YMDTime struct {
+	time.Time
+}
+
+func (t *YMDTime) UnmarshalJSON(b []byte) (err error) {
+	dateString := string(b)
+	if dateString == "null" {
+		t.Time = time.Now()
+		return nil
+	}
+	if dateString == `""` {
+		t.Time = time.Time{}
+		return nil
+	}
+	dateString = dateString[1 : len(dateString)-1] // 去除双引号
+	parsedTime, err := time.Parse("2006-01-02", dateString)
+	if err != nil {
+		return err
+	}
+	t.Time = parsedTime
+	return nil
+}

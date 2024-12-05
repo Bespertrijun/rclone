@@ -136,6 +136,7 @@ type Options struct {
 	UID     string               `config:"uid"`
 	CID     string               `config:"cid"`
 	SEID    string               `config:"seid"`
+	KID     string               `config:"kid"`
 	Timeout int64                `config:"timeout"`
 	Enc     encoder.MultiEncoder `config:"encoding"`
 }

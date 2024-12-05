@@ -108,8 +108,8 @@ func init() {
 			Help:     "SEID from cookie",
 			Required: true,
 		}, {
-			Name:     "timeout",
-			Help:     "Download more than how long to cancel the download task (base on your vfs read chunk size)",
+			Name:     "kid",
+			Help:     "KID from cookie",
 			Required: true,
 		}, {
 			Name:     config.ConfigEncoding,
@@ -336,6 +336,12 @@ func NewFs(ctx context.Context, name string, root string, m configmap.Mapper) (f
 	}, &http.Cookie{
 		Name:     "SEID",
 		Value:    opt.SEID,
+		Domain:   domain,
+		Path:     "/",
+		HttpOnly: true,
+	},&http.Cookie{
+		Name:     "KID",
+		Value:    opt.KID,
 		Domain:   domain,
 		Path:     "/",
 		HttpOnly: true,
